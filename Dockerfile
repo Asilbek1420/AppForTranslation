@@ -1,26 +1,35 @@
-FROM python:3.11-slim
+# =====================
+# 1st Stage: Dependencies Build
+# =====================
+FROM python:3.11-slim AS builder
 
-# System deps for audio processing
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
- && rm -rf /var/lib/apt/lists/*
+# Set working directory
+WORKDIR /app
+
+# Upgrade pip and install only dependencies
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+# =====================
+# 2nd Stage: Final Image
+# =====================
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy deps first for better caching
-COPY requirements.txt .
+# Install only what's needed for runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip and install Python deps
-RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt \
- # Install CPU-only torch from official index
- && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Copy installed packages from builder stage
+COPY --from=builder /usr/local /usr/local
 
-# Copy app
+# Copy the rest of your source code
 COPY . .
 
-# Expose (optional); Railway injects $PORT
+# Expose FastAPI port
 EXPOSE 8000
 
-# Run FastAPI; use Railway's $PORT if provided
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Command to run FastAPI
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
