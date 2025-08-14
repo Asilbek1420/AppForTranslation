@@ -1,6 +1,6 @@
-fastapi
-uvicorn
+Flask
 yt-dlp
+youtube-transcript-api
 openai-whisper
-transformers
-sentencepiece
+ffmpeg-python
+gunicorn
