@@ -1,19 +1,15 @@
 import os
 import tempfile
 from typing import Optional
-
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from yt_dlp import YoutubeDL
-
-# Lazy imports to speed cold start until first call
-whisper_model = None
-translator_model = None
-translator_tokenizer = None
-
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 import torch
 import whisper
+import requests
+import subprocess
+import uuid
 
 app = FastAPI(title="YouTube → Transcribe → Translate (All-in-One)")
 
@@ -22,6 +18,11 @@ WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")  # tiny/base/small/medi
 M2M_MODEL_NAME = os.getenv("M2M_MODEL", "facebook/m2m100_418M")
 DEFAULT_SRC_LANG = os.getenv("DEFAULT_SRC_LANG", "en")
 DEFAULT_TGT_LANG = os.getenv("DEFAULT_TGT_LANG", "fr")
+
+# Lazy-loaded models
+whisper_model = None
+translator_model = None
+translator_tokenizer = None
 
 
 def load_whisper():
@@ -55,8 +56,8 @@ def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
 
 class ProcessRequest(BaseModel):
     url: str
-    source_lang: Optional[str] = None   # e.g., "en", "ru", "uz"
-    target_lang: Optional[str] = None   # e.g., "fr", "ar", "de"
+    source_lang: Optional[str] = None
+    target_lang: Optional[str] = None
 
 
 @app.get("/health")
@@ -66,53 +67,75 @@ def health():
 
 @app.post("/process")
 def process(req: ProcessRequest):
-    """Full pipeline: download -> transcribe -> translate."""
-    src = req.source_lang or DEFAULT_SRC_LANG
-    tgt = req.target_lang or DEFAULT_TGT_LANG
-
-    # 1) Download YouTube audio to /tmp as mp3
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": "/tmp/%(id)s.%(ext)s",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "quiet": True,
-        "noplaylist": True,
-    }
-
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(req.url, download=True)
-        # normalize output path to mp3
-        raw_path = ydl.prepare_filename(info)
-        if raw_path.endswith(".webm"):
-            audio_path = raw_path.replace(".webm", ".mp3")
-        elif raw_path.endswith(".m4a"):
-            audio_path = raw_path.replace(".m4a", ".mp3")
-        else:
-            # fallback if already mp3 or other ext
-            audio_path = os.path.splitext(raw_path)[0] + ".mp3"
-
-    # 2) Transcribe with Whisper
-    model = load_whisper()
-    result = model.transcribe(audio_path, language=None)  # let Whisper detect language
-    transcript_text = result.get("text", "").strip()
-
-    # 3) Translate with M2M-100
-    translated_text = translate_text(transcript_text, src_lang=src, tgt_lang=tgt)
-
-    # Optional cleanup
+    """Full pipeline: download/convert -> transcribe -> translate."""
     try:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-    except Exception:
-        pass
+        src = req.source_lang or DEFAULT_SRC_LANG
+        tgt = req.target_lang or DEFAULT_TGT_LANG
 
-    return {
-        "source_lang": src,
-        "target_lang": tgt,
-        "transcript": transcript_text,
-        "translation": translated_text,
-    }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = os.path.join(tmpdir, f"{uuid.uuid4()}.mp3")
+
+            # Case 1: YouTube or supported sites
+            if "youtube.com" in req.url or "youtu.be" in req.url:
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                    "quiet": True,
+                    "noplaylist": True,
+                }
+                with YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(req.url, download=True)
+                    raw_path = ydl.prepare_filename(info)
+                    if raw_path.endswith(".webm"):
+                        audio_path = raw_path.replace(".webm", ".mp3")
+                    elif raw_path.endswith(".m4a"):
+                        audio_path = raw_path.replace(".m4a", ".mp3")
+                    else:
+                        audio_path = os.path.splitext(raw_path)[0] + ".mp3"
+
+            # Case 2: Direct .mp3 / .mp4
+            elif req.url.endswith((".mp3", ".mp4")):
+                r = requests.get(req.url, stream=True)
+                r.raise_for_status()
+                temp_file = os.path.join(tmpdir, os.path.basename(req.url))
+                with open(temp_file, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                if temp_file.endswith(".mp4"):
+                    subprocess.run(
+                        ["ffmpeg", "-i", temp_file, audio_path, "-y"],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                else:
+                    audio_path = temp_file
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported URL format.")
+
+            # Step 2: Transcribe
+            model = load_whisper()
+            result = model.transcribe(audio_path, language=None)
+            transcript_text = result.get("text", "").strip()
+
+            # Step 3: Translate
+            translated_text = translate_text(transcript_text, src_lang=src, tgt_lang=tgt)
+
+        return {
+            "status": "success",
+            "source_lang": src,
+            "target_lang": tgt,
+            "transcript": transcript_text,
+            "translation": translated_text,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
